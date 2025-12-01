@@ -1,0 +1,107 @@
+name: Deploy Frontend to Kubernetes
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  actions: write
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  get-pr-branch:
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/deploy-frontend')
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.pr-info.outputs.branch }}
+    steps:
+      - name: Get PR branch
+        id: pr-info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput('branch', pr.data.head.ref);
+
+  build-frontend:
+    needs: get-pr-branch
+    uses: ./.github/workflows/build-and-push-frontend.yml
+    with:
+      ref: ${{ needs.get-pr-branch.outputs.branch }}
+    secrets: inherit
+
+  deploy-frontend:
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/deploy-frontend')
+    needs: [get-pr-branch, build-frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.get-pr-branch.outputs.branch }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
+          role-session-name: monitoring-deploy-frontend-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update frontend deployment image
+        run: |
+          ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          IMAGE_TAG="${{ needs.build-frontend.outputs.image_tag }}"
+          IMAGE="${ECR_REGISTRY}/monitoring-frontend:${IMAGE_TAG}"
+          sed -i "s|image: .*|image: ${IMAGE}|g" k8s/frontend-deployment.yaml
+          sed -i 's|imagePullPolicy: .*|imagePullPolicy: Always|g' k8s/frontend-deployment.yaml
+
+      - name: Apply frontend deployment
+        run: |
+          kubectl apply -f k8s/frontend-deployment.yaml
+
+      - name: Wait for deployment
+        run: |
+          kubectl wait --for=condition=available --timeout=300s deployment/frontend -n monitoring-platform || true
+
+      - name: Get deployment status
+        run: |
+          echo "*** Frontend Deployment Status ***"
+          kubectl get deployment frontend -n monitoring-platform
+          echo ""
+          echo "*** Pod Status ***"
+          kubectl get pods -l app=monitoring-dashboard,component=frontend -n monitoring-platform
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ Frontend deployed successfully!'
+            });

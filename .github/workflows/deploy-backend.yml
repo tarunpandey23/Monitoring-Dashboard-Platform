@@ -1,0 +1,107 @@
+name: Deploy Backend to Kubernetes
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  actions: write
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  get-pr-branch:
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/deploy-backend')
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.pr-info.outputs.branch }}
+    steps:
+      - name: Get PR branch
+        id: pr-info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput('branch', pr.data.head.ref);
+
+  build-backend:
+    needs: get-pr-branch
+    uses: ./.github/workflows/build-and-push-backend.yml
+    with:
+      ref: ${{ needs.get-pr-branch.outputs.branch }}
+    secrets: inherit
+
+  deploy-backend:
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/deploy-backend')
+    needs: [get-pr-branch, build-backend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.get-pr-branch.outputs.branch }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
+          role-session-name: monitoring-deploy-backend-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update backend deployment image
+        run: |
+          ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          IMAGE_TAG="${{ needs.build-backend.outputs.image_tag }}"
+          IMAGE="${ECR_REGISTRY}/monitoring-backend:${IMAGE_TAG}"
+          sed -i "s|image: .*|image: ${IMAGE}|g" k8s/backend-deployment.yaml
+          sed -i 's|imagePullPolicy: .*|imagePullPolicy: Always|g' k8s/backend-deployment.yaml
+
+      - name: Apply backend deployment
+        run: |
+          kubectl apply -f k8s/backend-deployment.yaml
+
+      - name: Wait for deployment
+        run: |
+          kubectl wait --for=condition=available --timeout=300s deployment/backend -n monitoring-platform || true
+
+      - name: Get deployment status
+        run: |
+          echo "*** Backend Deployment Status ***"
+          kubectl get deployment backend -n monitoring-platform
+          echo ""
+          echo "*** Pod Status ***"
+          kubectl get pods -l app=monitoring-dashboard,component=backend -n monitoring-platform
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ Backend deployed successfully!'
+            });
