@@ -15,7 +15,6 @@ A production-grade, containerized microservices-based monitoring dashboard with 
 - [Accessing Services](#accessing-services)
 - [Viewing Logs & Troubleshooting](#viewing-logs--troubleshooting)
 - [Kubernetes Manifests Explained](#kubernetes-manifests-explained)
-- [Complete Architecture Diagram](#complete-architecture-diagram-for-drawio)
 - [Required Secrets](#required-secrets-github-actions)
 
 ---
@@ -77,7 +76,7 @@ Monitoring-Dashboard-Platform/
 
 ---
 
-## System Architecture Diagram
+## System Architecture
 
 ![System Architecture](./images/assignment.drawio.png)
 
